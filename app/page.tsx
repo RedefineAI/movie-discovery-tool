@@ -1,172 +1,193 @@
 // app/page.tsx
 "use client";
 
-import { useState } from 'react';
-import { TMDBMovie, OMDbRating, CombinedMovie } from '@/types';
-import Image from 'next/image';
+import { useState, useEffect, useCallback, useMemo } from 'react';
+import { CombinedMovie, Genre, FilterState } from '@/types';
+import { useDebounce } from '@/app/hooks/useDebounce';
+import { Header } from './components/ui/Header';
+import { Footer } from './components/ui/Footer';
+import { ResultsGrid } from './components/ResultsGrid';
+import { SearchAndType } from './components/SearchAndType';
+import { FiltersSidebar } from './components/FiltersSidebar';
+import { ResultsHeader } from './components/ResultsHeader';
 
-// Helper to calculate the combined score
-const calculateCombinedScore = (ratings: OMDbRating): number => {
-    let total = 0;
-    let count = 0;
-
-    // 1. IMDb (x10 to be out of 100)
-    const imdb = parseFloat(ratings.imdbRating);
-    if (!isNaN(imdb)) {
-        total += imdb * 10;
-        count++;
-    }
-
-    // 2. Rotten Tomatoes (remove '%' and parse)
-    const rtRating = ratings.Ratings?.find(r => r.Source === 'Rotten Tomatoes');
-    if (rtRating) {
-        const rtScore = parseInt(rtRating.Value.replace('%', ''), 10);
-        if (!isNaN(rtScore)) {
-            total += rtScore;
-            count++;
-        }
-    }
-
-    // 3. Metacritic
-    const meta = parseInt(ratings.Metascore, 10);
-    if (!isNaN(meta)) {
-        total += meta;
-        count++;
-    }
-
+const calculateCombinedScore = (omdb: any, tmdb: any): number => {
+    let total = 0, count = 0;
+    if (tmdb.vote_average > 0) { total += tmdb.vote_average * 10; count++; }
+    const imdb = parseFloat(omdb.imdbRating);
+    if (!isNaN(imdb)) { total += imdb * 10; count++; }
+    const rtRating = omdb.Ratings?.find((r: any) => r.Source === 'Rotten Tomatoes');
+    if (rtRating) { const rtScore = parseInt(rtRating.Value.replace('%', ''), 10); if (!isNaN(rtScore)) { total += rtScore; count++; } }
+    const meta = parseInt(omdb.Metascore, 10);
+    if (!isNaN(meta)) { total += meta; count++; }
     return count > 0 ? Math.round(total / count) : 0;
 };
 
-// Movie Card Component
-const MovieCard = ({ movie }: { movie: CombinedMovie }) => {
-    const posterUrl = movie.poster_path
-        ? `https://image.tmdb.org/t/p/w500${movie.poster_path}`
-        : null;
-
-    return (
-        <div className="bg-gray-800 rounded-lg overflow-hidden shadow-lg transform hover:scale-105 transition-transform duration-300">
-            <div className="relative h-96">
-                {posterUrl ? (
-                    <Image src={posterUrl} alt={movie.title} fill objectFit="cover" />
-                ) : (
-                    <div className="w-full h-full bg-gray-700 flex items-center justify-center">
-                        <span className="text-gray-400">No Poster</span>
-                    </div>
-                )}
-            </div>
-            <div className="p-4">
-                <h3 className="text-lg font-bold text-white">{movie.title}</h3>
-                <p className="text-sm text-gray-400 mb-2">{movie.release_date?.substring(0, 4)}</p>
-                
-                <div className="mt-2 p-3 bg-gray-700 rounded-lg">
-                    <div className="flex justify-between items-center mb-2">
-                        <span className="text-xl font-bold text-yellow-400">Combined Score</span>
-                        <span className="text-2xl font-extrabold text-white bg-yellow-500 rounded-full flex items-center justify-center w-12 h-12">
-                            {movie.combinedScore}
-                        </span>
-                    </div>
-                    <div className="text-xs text-gray-300 space-y-1">
-                        <p>IMDb: {movie.ratings.imdb}</p>
-                        <p>Rotten Tomatoes: {movie.ratings.rottenTomatoes}</p>
-                        <p>Metacritic: {movie.ratings.metacritic}</p>
-                    </div>
-                </div>
-            </div>
-        </div>
-    );
-};
-
-// Main Homepage Component
 export default function HomePage() {
+    const initialFilters: FilterState = { type: 'movie', with_genres: '', year: '', year_mode: 'exact', minRating: '0' };
+
+    const [apiMovies, setApiMovies] = useState<CombinedMovie[]>([]);
+    const [displayedMovies, setDisplayedMovies] = useState<CombinedMovie[]>([]);
+    const [allGenres, setAllGenres] = useState<Genre[]>([]);
+    const [filters, setFilters] = useState<FilterState>(initialFilters);
+    const [sortOption, setSortOption] = useState('popularity.desc');
     const [query, setQuery] = useState('');
-    const [movies, setMovies] = useState<CombinedMovie[]>([]);
-    const [isLoading, setIsLoading] = useState(false);
+    const [isLoading, setIsLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
-    const [searched, setSearched] = useState(false);
+
+    const hasActiveFilters = JSON.stringify(filters) !== JSON.stringify(initialFilters);
+    const debouncedQuery = useDebounce(query, 500);
+    const debouncedFilters = useDebounce(filters, 500);
 
     const tmdbApiKey = process.env.NEXT_PUBLIC_TMDB_API_KEY;
     const omdbApiKey = process.env.NEXT_PUBLIC_OMDB_API_KEY;
 
-    const handleSearch = async (e: React.FormEvent) => {
-        e.preventDefault();
-        if (!query) return;
+    const resetFilters = () => { setQuery(''); setFilters(initialFilters); };
 
+    const genreMap = useMemo(() => new Map(allGenres.map(g => [g.id, g.name])), [allGenres]);
+
+    const fetchAPIData = useCallback(async () => {
+        if (!tmdbApiKey || !omdbApiKey) {
+            setError("API key is not configured.");
+            return;
+        }
         setIsLoading(true);
         setError(null);
-        setMovies([]);
-        setSearched(true);
-
         try {
-            // 1. Fetch from TMDB
-            const tmdbRes = await fetch(`https://api.themoviedb.org/3/search/movie?api_key=${tmdbApiKey}&query=${encodeURIComponent(query)}`);
-            if (!tmdbRes.ok) throw new Error('Failed to fetch from TMDB');
-            const tmdbData = await tmdbRes.json();
-            const tmdbMovies: TMDBMovie[] = tmdbData.results;
+            let initialResults: any[] = [];
 
-            // 2. For each movie, fetch ratings from OMDb
-            const combinedMoviesData = await Promise.all(
-                tmdbMovies.map(async (movie) => {
-                    const omdbRes = await fetch(`https://www.omdbapi.com/?apikey=${omdbApiKey}&t=${encodeURIComponent(movie.title)}`);
-                    const omdbData: OMDbRating = await omdbRes.json();
-                    
-                    const combinedScore = calculateCombinedScore(omdbData);
+            // ========================================================================
+            // == THE NEW "MERGE STRATEGY" LOGIC                                   ==
+            // ========================================================================
+            if (debouncedQuery) {
+                // When searching, fetch from multiple sources to create a high-quality pool
+                const searchUrl = `https://api.themoviedb.org/3/search/${debouncedFilters.type}?api_key=${tmdbApiKey}&query=${debouncedQuery}&include_adult=false`;
+                const popularUrl = `https://api.themoviedb.org/3/discover/${debouncedFilters.type}?api_key=${tmdbApiKey}&sort_by=popularity.desc&include_adult=false`;
 
-                    const rtRating = omdbData.Ratings?.find(r => r.Source === 'Rotten Tomatoes')?.Value || 'N/A';
-                    
-                    return {
-                        ...movie,
-                        ratings: {
-                            imdb: omdbData.imdbRating || 'N/A',
-                            rottenTomatoes: rtRating,
-                            metacritic: omdbData.Metascore || 'N/A',
-                        },
-                        combinedScore,
-                    };
+                const [searchResponse, popularResponse] = await Promise.all([
+                    fetch(searchUrl),
+                    fetch(popularUrl)
+                ]);
+
+                if (!searchResponse.ok || !popularResponse.ok) throw new Error('Failed to fetch initial data from TMDB.');
+
+                const searchData = await searchResponse.json();
+                const popularData = await popularResponse.json();
+                
+                // Merge and deduplicate the results
+                const allResults = [...searchData.results, ...popularData.results];
+                const uniqueResults = Array.from(new Map(allResults.map(item => [item.id, item])).values());
+                initialResults = uniqueResults;
+            } else {
+                // When discovering, use the user's selected filters
+                const params = new URLSearchParams({ api_key: tmdbApiKey, sort_by: sortOption, include_adult: 'false' });
+                if (debouncedFilters.with_genres) params.append('with_genres', debouncedFilters.with_genres);
+                if (debouncedFilters.year) {
+                    const year = debouncedFilters.year;
+                    const dateKey = debouncedFilters.type === 'movie' ? 'primary_release_date' : 'first_air_date';
+                    if (debouncedFilters.year_mode === 'exact') params.append(debouncedFilters.type === 'movie' ? 'primary_release_year' : 'first_air_date_year', year);
+                    else if (debouncedFilters.year_mode === 'after') params.append(`${dateKey}.gte`, `${year}-01-01`);
+                    else if (debouncedFilters.year_mode === 'before') params.append(`${dateKey}.lte`, `${year}-12-31`);
+                }
+                const discoverRes = await fetch(`https://api.themoviedb.org/3/discover/${debouncedFilters.type}?${params.toString()}`);
+                if (!discoverRes.ok) throw new Error('Failed to fetch from TMDB.');
+                const discoverData = await discoverRes.json();
+                initialResults = discoverData.results;
+            }
+
+            // Now, process the high-quality initialResults list
+            const detailedMovies = await Promise.all(
+                initialResults.slice(0, 40).map(async (baseMovie: any) => { // Process a larger pool
+                    try {
+                        const detailsRes = await fetch(`https://api.themoviedb.org/3/${filters.type}/${baseMovie.id}?api_key=${tmdbApiKey}`);
+                        const tmdbDetails = await detailsRes.json();
+                        const imdbId = tmdbDetails.imdb_id;
+                        if (!imdbId) return null;
+                        
+                        const omdbRes = await fetch(`https://www.omdbapi.com/?apikey=${omdbApiKey}&i=${imdbId}`);
+                        const omdbData = await omdbRes.json();
+                        if(omdbData.Response === "False") return null;
+
+                        const movieGenres = baseMovie.genre_ids.map((id: number) => genreMap.get(id)).filter(Boolean) as string[];
+                        return { ...baseMovie, title: baseMovie.title || baseMovie.name, release_date: baseMovie.release_date || baseMovie.first_air_date, ratings: { imdb: omdbData.imdbRating || 'N/A', rottenTomatoes: omdbData.Ratings?.find((r:any) => r.Source === 'Rotten Tomatoes')?.Value || 'N/A', metacritic: omdbData.Metascore || 'N/A' }, combinedScore: calculateCombinedScore(omdbData, baseMovie), director: omdbData.Director, genres: movieGenres };
+                    } catch (e) { return null; }
                 })
             );
+            
+            setApiMovies(detailedMovies.filter(Boolean) as CombinedMovie[]);
 
-            setMovies(combinedMoviesData);
-
-        // ========= THIS IS THE FIX =========
         } catch (err) {
-            if (err instanceof Error) {
-                setError(err.message);
-            } else {
-                setError("An unknown error occurred");
-            }
-        // ===================================
+            if (err instanceof Error) setError(err.message);
         } finally {
             setIsLoading(false);
         }
-    };
+    }, [debouncedFilters, debouncedQuery, sortOption, tmdbApiKey, omdbApiKey, filters.type, genreMap]);
+
+    useEffect(() => { fetchAPIData(); }, [fetchAPIData]);
+    
+    useEffect(() => {
+        const fetchAllGenres = async () => {
+            if (!tmdbApiKey) return;
+            const movieRes = await fetch(`https://api.themoviedb.org/3/genre/movie/list?api_key=${tmdbApiKey}`);
+            const tvRes = await fetch(`https://api.themoviedb.org/3/genre/tv/list?api_key=${tmdbApiKey}`);
+            const movieData = await movieRes.json();
+            const tvData = await tvRes.json();
+            setAllGenres(Array.from(new Map([...movieData.genres, ...tvData.genres].map(item => [item.id, item])).values()));
+        };
+        fetchAllGenres();
+    }, [tmdbApiKey]);
+
+    // This useEffect handles all client-side processing
+    useEffect(() => {
+        let processedMovies = [...apiMovies];
+
+        // If there's a search query, we must filter the merged list to only show relevant titles.
+        if (debouncedQuery) {
+            processedMovies = processedMovies.filter(movie =>
+                movie.title.toLowerCase().includes(debouncedQuery.toLowerCase())
+            );
+        }
+
+        // Apply the minimum rating filter.
+        processedMovies = processedMovies.filter(
+            movie => movie.combinedScore >= parseInt(filters.minRating, 10)
+        );
+        
+        // Apply the user-selected sort option. For searches, they can now re-sort the high-quality list.
+        if (sortOption.startsWith('client-')) {
+            processedMovies.sort((a, b) => {
+                let valA = 0, valB = 0;
+                if (sortOption === 'client-combined.desc') { valA = a.combinedScore; valB = b.combinedScore; }
+                if (sortOption === 'client-imdb.desc') { valA = parseFloat(a.ratings.imdb); valB = parseFloat(b.ratings.imdb); }
+                if (sortOption === 'client-tmdb.desc') { valA = a.vote_average * 10; valB = b.vote_average * 10; }
+                return (isNaN(valB) ? 0 : valB) - (isNaN(valA) ? 0 : valA);
+            });
+        } else if (debouncedQuery) {
+            // As a default for searches, sort by our combined score unless the user picks another client sort.
+            processedMovies.sort((a, b) => b.combinedScore - a.combinedScore);
+        }
+        
+        setDisplayedMovies(processedMovies);
+    }, [apiMovies, filters.minRating, sortOption, debouncedQuery]);
 
     return (
-        <main className="container mx-auto p-4 md:p-8">
-            <h1 className="text-4xl font-bold text-center text-white mb-8">Movie Discovery Tool</h1>
-            
-            <form onSubmit={handleSearch} className="flex justify-center mb-8 gap-2">
-                <input
-                    type="text"
-                    value={query}
-                    onChange={(e) => setQuery(e.target.value)}
-                    placeholder="Search for a movie..."
-                    className="w-full max-w-md p-3 rounded-l-md bg-gray-800 text-white border border-gray-700 focus:outline-none focus:ring-2 focus:ring-yellow-500"
-                />
-                <button type="submit" disabled={isLoading} className="bg-yellow-500 text-black font-bold px-6 py-3 rounded-r-md hover:bg-yellow-400 disabled:bg-gray-500">
-                    {isLoading ? '...' : 'Search'}
-                </button>
-            </form>
-
-            {isLoading && <p className="text-center text-white">Loading...</p>}
-            {error && <p className="text-center text-red-500">Error: {error}</p>}
-
-            {!isLoading && searched && movies.length === 0 && (
-                <p className="text-center text-gray-400">No movies found. Try another search!</p>
-            )}
-
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
-                {movies.map(movie => <MovieCard key={movie.id} movie={movie} />)}
-            </div>
-        </main>
+        <div className="flex flex-col min-h-screen">
+            <main className="flex-grow container mx-auto px-4">
+                <Header />
+                <div className="grid grid-cols-1 lg:grid-cols-4 gap-8">
+                    <div className="lg:col-span-1">
+                        <FiltersSidebar genres={allGenres} filters={filters} setFilters={setFilters} resetFilters={resetFilters} hasActiveFilters={hasActiveFilters} />
+                    </div>
+                    <div className="lg:col-span-3">
+                        <SearchAndType query={query} setQuery={setQuery} filters={filters} setFilters={setFilters} />
+                        <div className="mt-8">
+                            <ResultsHeader sortOption={sortOption} setSortOption={setSortOption} resultsCount={displayedMovies.length} />
+                            <ResultsGrid movies={displayedMovies} isLoading={isLoading} error={error} searched={true} />
+                        </div>
+                    </div>
+                </div>
+            </main>
+            <Footer />
+        </div>
     );
 }
