@@ -127,8 +127,14 @@ export default function HomePage() {
 
             setMovies(combinedMoviesData);
 
-        } catch (err: any) {
-            setError(err.message);
+        // ========= THIS IS THE FIX =========
+        } catch (err) {
+            if (err instanceof Error) {
+                setError(err.message);
+            } else {
+                setError("An unknown error occurred");
+            }
+        // ===================================
         } finally {
             setIsLoading(false);
         }
